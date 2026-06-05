@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nearby Trashcan Finder</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #map { height: 100vh; width: 100%; }
+        .sidebar { max-height: 100vh; overflow-y: auto; }
+        .leaflet-popup-content-wrapper { border-radius: 8px; }
+        .trash-icon { filter: hue-rotate(90deg); }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div class="flex flex-col md:flex-row h-screen">
+        <!-- Sidebar -->
+        <div class="w-full md:w-96 bg-white shadow-lg z-10 flex flex-col sidebar">
+            <div class="p-4 border-b">
+                <h1 class="text-xl font-bold text-gray-800">🗑️ Trashcan Finder</h1>
+                <p class="text-sm text-gray-500 mt-1">Find nearby trashcans & recycling bins</p>
+            </div>
+
+            <!-- Controls -->
+            <div class="p-4 space-y-3 border-b">
+                <button id="locateBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded transition">
+                    📍 Find My Location
+                </button>
+
+                <div class="flex gap-2">
+                    <input id="searchInput" type="text" placeholder="Search address / city..."
+                        class="flex-1 border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400">
+                    <button id="searchBtn" class="bg-gray-700 hover:bg-gray-800 text-white px-3 py-2 rounded text-sm transition">
+                        Search
+                    </button>
+                </div>
+
+                <div>
+                    <label class="text-sm font-medium text-gray-700">Search radius: <span id="radiusValue">500</span>m</label>
+                    <input id="radiusSlider" type="range" min="100" max="5000" step="100" value="500"
+                        class="w-full mt-1 accent-blue-600">
+                </div>
+
+                <button id="searchTrashBtn" class="w-full bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    🔍 Search Trashcans Nearby
+                </button>
+
+                <button id="recenterBtn" class="w-full bg-gray-200 hover:bg-gray-300 text-gray-800 font-medium py-2 px-4 rounded transition">
+                    🎯 Recenter on Me
+                </button>
+            </div>
+
+            <!-- Status -->
+            <div id="statusArea" class="px-4 py-2 text-sm hidden"></div>
+
+            <!-- Results List -->
+            <div class="flex-1 overflow-y-auto p-4">
+                <h2 class="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-2">Nearby Trashcans</h2>
+                <div id="resultsList" class="space-y-2">
+                    <p class="text-gray-400 text-sm text-center py-8">Press "Find My Location" or search an address to begin.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Map -->
+        <div class="flex-1 relative">
+            <div id="map"></div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let map, userMarker, userLat = null, userLng = null;
+        let trashMarkers = [];
+        const defaultLat = 39.9042, defaultLng = 116.4074; // Beijing fallback
+
+        // Haversine distance in meters
+        function getDistance(lat1, lng1, lat2, lng2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLng = (lng2 - lng1) * Math.PI / 180;
+            const a = Math.sin(dLat/2)**2 + Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) * Math.sin(dLng/2)**2;
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        function formatDistance(m) {
+            if (m >= 1000) return (m/1000).toFixed(2) + ' km';
+            return Math.round(m) + ' m';
+        }
+
+        // Status messages
+        function showStatus(msg, type = 'info') {
+            const el = document.getElementById('statusArea');
+            el.textContent = msg;
+            el.className = 'px-4 py-2 text-sm ' + (type === 'error' ? 'bg-red-100 text-red-700' : type === 'success' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700');
+            el.classList.remove('hidden');
+        }
+        function clearStatus() {
+            document.getElementById('statusArea').classList.add('hidden');
+        }
+
+        // Initialize map
+        function initMap() {
+            map = L.map('map').setView([defaultLat, defaultLng], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+        }
+
+        // Set user position
+        function setUserPosition(lat, lng, zoom = 16) {
+            userLat = lat;
+            userLng = lng;
+            if (userMarker) map.removeLayer(userMarker);
+            userMarker = L.marker([lat, lng], {
+                icon: L.divIcon({
+                    className: 'bg-blue-600 rounded-full border-2 border-white shadow-lg',
+                    iconSize: [16, 16], iconAnchor: [8, 8]
+                })
+            }).addTo(map).bindPopup('<b>You are here</b>').openPopup();
+            map.setView([lat, lng], zoom);
+            document.getElementById('searchTrashBtn').disabled = false;
+        }
+
+        // Overpass query
+        async function searchTrashcans() {
+            if (userLat === null || userLng === null) {
+                showStatus('Please set your location first.', 'error');
+                return;
+            }
+            clearStatus();
+            showStatus('Searching...', 'info');
+
+            // Clear old markers
+            trashMarkers.forEach(m => map.removeLayer(m));
+            trashMarkers = [];
+
+            const radius = document.getElementById('radiusSlider').value;
+            const query = `
+                [out:json][timeout:15];
+                (
+                  node["amenity"="waste_basket"](around:${radius},${userLat},${userLng});
+                  node["amenity"="waste_disposal"](around:${radius},${userLat},${userLng});
+                  node["amenity"="recycling"](around:${radius},${userLat},${userLng});
+                );
+                out body;
+            `;
+
+            try {
+                const res = await fetch('https://overpass-api.de/api/interpreter', {
+                    method: 'POST',
+                    body: query
+                });
+                if (!res.ok) throw new Error('Overpass API error');
+                const data = await res.json();
+                const elements = data.elements || [];
+
+                if (elements.length === 0) {
+                    showStatus(`No trashcans found within ${radius}m. Try increasing the radius.`, 'error');
+                    renderList([]);
+                    return;
+                }
+
+                // Process and sort by distance
+                const items = elements.map(el => {
+                    const dist = getDistance(userLat, userLng, el.lat, el.lon);
+                    const type = el.tags?.amenity || 'trashcan';
+                    const name = el.tags?.name || type.replace('_', ' ');
+                    return { lat: el.lat, lng: el.lon, type, name, dist };
+                }).sort((a, b) => a.dist - b.dist);
+
+                // Plot markers
+                items.forEach(item => {
+                    const color = item.type === 'recycling' ? '#22c55e' : item.type === 'waste_disposal' ? '#f59e0b' : '#10b981';
+                    const m = L.circleMarker([item.lat, item.lng], {
+                        radius: 8, fillColor: color, color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.9
+                    }).addTo(map);
+
+                    const gmapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${userLat},${userLng}&destination=${item.lat},${item.lng}&travelmode=walking`;
+                    m.bindPopup(`
+                        <div class="text-sm">
+                            <b>${item.name.charAt(0).toUpperCase() + item.name.slice(1)}</b><br>
+                            <span class="text-gray-600">${formatDistance(item.dist)} away</span><br>
+                            <a href="${gmapsUrl}" target="_blank" class="text-blue-600 underline">🗺️ Get Directions</a>
+                        </div>
+                    `);
+                    trashMarkers.push(m);
+                });
+
+                renderList(items);
+                showStatus(`Found ${items.length} trashcan(s) within ${radius}m.`, 'success');
+
+            } catch (err) {
+                console.error(err);
+                showStatus('Failed to fetch data. Please try again later.', 'error');
+            }
+        }
+
+        // Render sidebar list
+        function renderList(items) {
+            const container = document.getElementById('resultsList');
+            if (items.length === 0) {
+                container.innerHTML = '<p class="text-gray-400 text-sm text-center py-8">No results yet.</p>';
+                return;
+            }
+            container.innerHTML = items.map((item, idx) => {
+                const gmapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${userLat},${userLng}&destination=${item.lat},${item.lng}&travelmode=walking`;
+                const icon = item.type === 'recycling' ? '♻️' : item.type === 'waste_disposal' ? '🚮' : '🗑️';
+                return `
+                    <div class="bg-gray-50 rounded p-3 hover:bg-gray-100 transition cursor-pointer border" onclick="focusMarker(${idx})">
+                        <div class="flex justify-between items-start">
+                            <div>
+                                <span class="text-lg">${icon}</span>
+                                <span class="font-medium text-gray-800 text-sm">${item.name.charAt(0).toUpperCase() + item.name.slice(1)}</span>
+                            </div>
+                            <span class="text-xs text-gray-500">${formatDistance(item.dist)}</span>
+                        </div>
+                        <a href="${gmapsUrl}" target="_blank" class="text-xs text-blue-600 underline mt-1 inline-block">Directions</a>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function focusMarker(idx) {
+            const m = trashMarkers[idx];
+            if (m) {
+                map.setView(m.getLatLng(), 18);
+                m.openPopup();
+            }
+        }
+
+        // Geolocation
+        function locateMe() {
+            clearStatus();
+            if (!navigator.geolocation) {
+                showStatus('Geolocation is not supported by your browser.', 'error');
+                return;
+            }
+            showStatus('Getting your location...', 'info');
+            navigator.geolocation.getCurrentPosition(
+                pos => {
+                    setUserPosition(pos.coords.latitude, pos.coords.longitude);
+                    showStatus('Location found!', 'success');
+                    searchTrashcans();
+                },
+                err => {
+                    showStatus('Location denied. Use the search box instead.', 'error');
+                    console.error(err);
+                },
+                { enableHighAccuracy: true, timeout: 10000 }
+            );
+        }
+
+        // Address search via Nominatim
+        async function searchAddress() {
+            const q = document.getElementById('searchInput').value.trim();
+            if (!q) return;
+            clearStatus();
+            showStatus('Searching address...', 'info');
+            try {
+                const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}`);
+                const data = await res.json();
+                if (data.length === 0) {
+                    showStatus('Address not found.', 'error');
+                    return;
+                }
+                const place = data[0];
+                setUserPosition(parseFloat(place.lat), parseFloat(place.lon));
+                showStatus(`Showing: ${place.display_name}`, 'success');
+                searchTrashcans();
+            } catch (err) {
+                showStatus('Search failed. Please try again.', 'error');
+            }
+        }
+
+        // Event listeners
+        document.getElementById('locateBtn').addEventListener('click', locateMe);
+        document.getElementById('searchBtn').addEventListener('click', searchAddress);
+        document.getElementById('searchInput').addEventListener('keypress', e => { if (e.key === 'Enter') searchAddress(); });
+        document.getElementById('searchTrashBtn').addEventListener('click', searchTrashcans);
+        document.getElementById('recenterBtn').addEventListener('click', () => {
+            if (userLat !== null && userLng !== null) map.setView([userLat, userLng], 16);
+            else showStatus('No location set yet.', 'error');
+        });
+        document.getElementById('radiusSlider').addEventListener('input', e => {
+            document.getElementById('radiusValue').textContent = e.target.value;
+        });
+
+        // Init
+        initMap();
+
+        // Auto-locate on load
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                pos => {
+                    setUserPosition(pos.coords.latitude, pos.coords.longitude);
+                    searchTrashcans();
+                },
+                () => { /* silent fail, user can press button */ }
+            );
+        }
+    </script>
+</body>
+</html>
