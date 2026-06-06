@@ -4,7 +4,7 @@ A simple web app that shows nearby trashcans and recycling bins on an interactiv
 
 ## Live Demo
 
-Open `index.html` in any modern browser.
+Download and open `index.html` in any modern browser.
 
 ## Features
 
